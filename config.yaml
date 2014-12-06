@@ -1,0 +1,25 @@
+target: /mnt/target
+
+languages:
+  - deu:
+    - deu
+    - ger
+  - eng:
+    - eng
+
+video:
+  resolution: 1280
+  quality: 22
+  preset: medium
+  profile: high
+
+audio:
+  format:
+    - aac: copy
+    - ac3: copy
+    - default: ac3
+
+subtitles:
+  format:
+    - hdmv_pgs_subtitle: copy
+    - default: copy

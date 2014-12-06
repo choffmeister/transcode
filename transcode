@@ -1,0 +1,183 @@
+#!/usr/bin/python
+
+import re
+import sys
+import subprocess
+import os
+import time
+import yaml
+import lib.ffmpeg as ffmpeg
+import lib.utils as utils
+
+# legacy configuration
+languages = ['deu', 'eng']
+language_aliases = {
+  'deu': ['deu', 'ger'],
+  'eng': ['eng']
+}
+audio_format_preferences = [ ('aac', 'copy'), ('ac3', 'copy'), ('*', 'ac3') ]
+subtitle_format_preferences = [ ('hdmv_pgs_subtitle', 'copy'), ('*', 'copy') ]
+
+# regexes
+progress_regex_parts = [
+  'frame=\s*(?P<frame>\d+)',
+  'fps=\s*(?P<fps>\d+(\.\d+)?)',
+  'q=\s*(?P<q>\d+(\.\d+)?)',
+  'size=\s*(?P<size>\d+)\s*kB',
+  'time=\s*(?P<time>\d{2}:\d{2}:\d{2}.\d{2})',
+  'bitrate=\s*(?P<bitrate>\d+(\.\d+))\s*kbits/s'
+]
+progress_regex = re.compile('\s*'.join(progress_regex_parts))
+
+def pick_video_stream(streams):
+  for language in languages:
+    for alias in language_aliases[language]:
+      for s in streams:
+        if s['lang'] == alias:
+          return s
+
+  # fallback to first video stream
+  return streams[0]
+
+def pick_stream(streams, language, preferences):
+  # in the order of preferences ...
+  for pref in preferences:
+    # ... try to find in every available stream ...
+    for s in streams:
+      # ... the first that matches in language ...
+      for alias in language_aliases[language]:
+        if s['lang'] == alias:
+          # ... and in prefered format
+          if pref[0] == s['fmt'] or pref[0] == '*':
+            s['fmt2'] = pref[1]
+            return s
+
+  # no matching could be found
+  return None
+
+def transcode(path_src, path_dest, config):
+  print 'source path: %s' % path_src
+  print 'target path: %s' % path_dest
+
+  # find streams
+  print 'detect duration...'
+  duration_str, duration_secs = ffmpeg.detect_duration(path_src)
+
+  print 'detecting streams...'
+  streams_in = ffmpeg.detect_streams(path_src)
+  video_streams_in = filter(lambda s: s['type'] == 'Video', streams_in)
+  audio_streams_in = filter(lambda s: s['type'] == 'Audio', streams_in)
+  subtitle_streams_in = filter(lambda s: s['type'] == 'Subtitle', streams_in)
+
+  # define output stream variables
+  video_stream_out = None
+  audio_streams_out = []
+  subtitle_streams_out = []
+
+  # pick streams
+  video_stream_out = pick_video_stream(video_streams_in)
+  for language in languages:
+    audio_stream = pick_stream(audio_streams_in, language, audio_format_preferences)
+    subtitle_stream = pick_stream(subtitle_streams_in, language, subtitle_format_preferences)
+
+    if audio_stream is not None: audio_streams_out.append(audio_stream)
+    if subtitle_stream is not None: subtitle_streams_out.append(subtitle_stream)
+
+  # if no matching audio stream could be found
+  # then add all in audio streams
+  if len(audio_streams_out) == 0:
+    for s in audio_streams_in:
+      s['fmt2'] = 'copy'
+      audio_streams_out.append(s)
+
+  # if no matching subtitle stream could be found
+  # then add all in subtitle streams
+  if len(subtitle_streams_out) == 0:
+    for s in subtitle_streams_in:
+      s['fmt2'] = 'copy'
+      subtitle_streams_out.append(s)
+
+  print 'video streams:'
+  print '- Stream %s, Language %s, Format %s -> libx264' % (video_stream_out['id'], video_stream_out['lang'], video_stream_out['fmt'])
+  print 'audio streams:'
+  for s in audio_streams_out:
+    print '- Stream %s, Language %s, Format %s -> %s' % (s['id'], s['lang'], s['fmt'], s['fmt2'])
+  print 'subtitle streams:'
+  for s in subtitle_streams_out:
+    print '- Stream %s, Language %s, Format %s -> %s' % (s['id'], s['lang'], s['fmt'], s['fmt2'])
+
+  # detect crop
+  print 'detecting crop...'
+  crop = ffmpeg.detect_crop(path_src)
+  print 'crop: %s:%s:%s:%s' % crop
+
+  # set input path
+  arguments = ['ffmpeg', '-i', path_src]
+
+  # video configuration
+  arguments += ['-map', video_stream_out['id']]
+  arguments += ['-c:v', 'libx264']
+  arguments += ['-crf', str(config['video']['quality'])]
+  arguments += ['-preset', config['video']['preset']]
+  arguments += ['-profile:v', config['video']['profile']]
+  if config['video']['resolution'] is not None: arguments += ['-vf', 'scale=%d:-1' % config['video']['resolution']]
+
+  # audio configuration
+  for i, s in enumerate(audio_streams_out):
+    arguments += ['-map', s['id']]
+    arguments += ['-c:a:%d' % i, s['fmt2']]
+
+  # subtitle configuration
+  for i, s in enumerate(subtitle_streams_out):
+    arguments += ['-map', s['id']]
+    arguments += ['-c:s:%d' % i, s['fmt2']]
+
+  # enable crop
+  arguments += ['-filter:v', 'crop=%s:%s:%s:%s' % crop]
+
+  # enable multithreading
+  arguments += ['-threads', '0']
+
+  # overwrite destination file
+  arguments.append('-y')
+
+  # set output path
+  arguments.append(path_dest)
+
+  # start encoding and log output to log file
+  log = open('%s.log' % path_dest, 'w')
+  proc = subprocess.Popen(arguments, stderr=log)
+
+  while proc.poll() is None:
+    log_tail = utils.tail('%s.log' % path_dest, 512)
+    last_progress_updates = filter(lambda s: s is not '', map(lambda s: s.strip(), log_tail.split('\r')))
+
+    if len(last_progress_updates) > 0:
+      last_progress_update = last_progress_updates[-1]
+
+      match = progress_regex.match(last_progress_update)
+      if match is not None:
+        fps = match.group('fps')
+        time_str = match.group('time')
+        time_secs = utils.timestring_to_seconds(time_str)
+
+        sys.stdout.write('[%f%%] FPS: %s Time: %s / %s \r' % (time_secs / duration_secs * 100.0, fps, time_str, duration_str))
+        sys.stdout.flush()
+
+    time.sleep(1)
+
+  # close log file
+  log.close()
+
+
+# configuration
+working_dir = os.path.dirname(os.path.realpath(__file__))
+config_file = os.path.join(working_dir, 'config.yaml')
+with open(config_file, 'r') as f: config = yaml.load(f)
+path_src = sys.argv[1]
+path_dest = os.path.join(config['target'], '%s.mkv' % os.path.splitext(os.path.basename(path_src))[0])
+
+print(config)
+
+# run
+transcode(path_src, path_dest, config)
